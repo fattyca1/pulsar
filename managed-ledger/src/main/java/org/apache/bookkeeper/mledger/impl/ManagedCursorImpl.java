@@ -169,6 +169,9 @@ public class ManagedCursorImpl implements ManagedCursor {
     private final ReadWriteLock lock = new ReentrantReadWriteLock();
 
     private RateLimiter markDeleteLimiter;
+    // The cursor is considered "dirty" when there are mark-delete updates that are only applied in memory,
+    // because of the rate limiting.
+    private volatile boolean isDirty = false;
 
     private boolean alwaysInactive = false;
 
@@ -992,6 +995,11 @@ public class ManagedCursorImpl implements ManagedCursor {
                     if (config.isDeletionAtBatchIndexLevelEnabled() && batchDeletedIndexes != null) {
                         batchDeletedIndexes.values().forEach(BitSetRecyclable::recycle);
                         batchDeletedIndexes.clear();
+                        long[] resetWords = newPosition.ackSet;
+                        if (resetWords != null) {
+                            BitSetRecyclable ackSet = BitSetRecyclable.create().resetWords(resetWords);
+                            batchDeletedIndexes.put(newPosition, ackSet);
+                        }
                     }
 
                     PositionImpl oldReadPosition = readPosition;
@@ -1534,18 +1542,21 @@ public class ManagedCursorImpl implements ManagedCursor {
         markDeletePosition = newMarkDeletePosition;
         individualDeletedMessages.removeAtMost(markDeletePosition.getLedgerId(), markDeletePosition.getEntryId());
 
-        if (readPosition.compareTo(newMarkDeletePosition) <= 0) {
-            // If the position that is mark-deleted is past the read position, it
-            // means that the client has skipped some entries. We need to move
-            // read position forward
-            PositionImpl oldReadPosition = readPosition;
-            readPosition = ledger.getNextValidPosition(newMarkDeletePosition);
-
-            if (log.isDebugEnabled()) {
-                log.debug("[{}] Moved read position from: {} to: {}, and new mark-delete position {}", ledger.getName(),
-                        oldReadPosition, readPosition, markDeletePosition);
+        READ_POSITION_UPDATER.updateAndGet(this, currentReadPosition -> {
+            if (currentReadPosition.compareTo(markDeletePosition) <= 0) {
+                // If the position that is mark-deleted is past the read position, it
+                // means that the client has skipped some entries. We need to move
+                // read position forward
+                PositionImpl newReadPosition = ledger.getNextValidPosition(markDeletePosition);
+                if (log.isDebugEnabled()) {
+                    log.debug("[{}] Moved read position from: {} to: {}, and new mark-delete position {}", ledger.getName(),
+                            currentReadPosition, newReadPosition, markDeletePosition);
+                }
+                return newReadPosition;
+            } else {
+                return currentReadPosition;
             }
-        }
+        });
 
         return newMarkDeletePosition;
     }
@@ -1618,6 +1629,7 @@ public class ManagedCursorImpl implements ManagedCursor {
 
         // Apply rate limiting to mark-delete operations
         if (markDeleteLimiter != null && !markDeleteLimiter.tryAcquire()) {
+            isDirty = true;
             lastMarkDeleteEntry = new MarkDeleteEntry(newPosition, properties, null, null);
             callback.markDeleteComplete(ctx);
             return;
@@ -2765,6 +2777,24 @@ public class ManagedCursorImpl implements ManagedCursor {
                 ((PositionImpl) position).getEntryId()) || ((PositionImpl) position).compareTo(markDeletePosition) <= 0 ;
     }
 
+    //this method will return a copy of the position's ack set
+    public long[] getBatchPositionAckSet(Position position) {
+        if (!(position instanceof PositionImpl)) {
+            return null;
+        }
+
+        if (batchDeletedIndexes != null) {
+            BitSetRecyclable bitSetRecyclable = batchDeletedIndexes.get(position);
+            if (bitSetRecyclable == null) {
+                return null;
+            } else {
+                return bitSetRecyclable.toLongArray();
+            }
+        } else {
+            return null;
+        }
+    }
+
     /**
      * Checks given position is part of deleted-range and returns next position of upper-end as all the messages are
      * deleted up to that point.
@@ -2857,6 +2887,24 @@ public class ManagedCursorImpl implements ManagedCursor {
         this.entriesReadSize += readEntriesSize;
     }
 
+    void flush() {
+        if (!isDirty) {
+            return;
+        }
+
+        isDirty = false;
+        asyncMarkDelete(lastMarkDeleteEntry.newPosition, lastMarkDeleteEntry.properties, new MarkDeleteCallback() {
+            @Override
+            public void markDeleteComplete(Object ctx) {
+            }
+
+            @Override
+            public void markDeleteFailed(ManagedLedgerException exception, Object ctx) {
+                log.warn("[{}][{}] Failed to flush mark-delete position", ledger.getName(), name, exception);
+            }
+        }, null);
+    }
+
     private int applyMaxSizeCap(int maxEntries, long maxSizeBytes) {
         if (maxSizeBytes == NO_MAX_SIZE_LIMIT) {
             return maxEntries;
@@ -2881,14 +2929,6 @@ public class ManagedCursorImpl implements ManagedCursor {
         }
 
         return Math.min(maxEntriesBasedOnSize, maxEntries);
-    }
-
-    public void internalInitBatchDeletedIndex(PositionImpl position, int totalNumMessageInBatch) {
-        batchDeletedIndexes.computeIfAbsent(position, key -> {
-            BitSetRecyclable bitSetRecyclable = BitSetRecyclable.create();
-            bitSetRecyclable.set(0, totalNumMessageInBatch);
-            return bitSetRecyclable;
-        });
     }
 
     private static final Logger log = LoggerFactory.getLogger(ManagedCursorImpl.class);
